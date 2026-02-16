@@ -1,0 +1,486 @@
+rm(list = ls())
+
+setwd("C:/Users/wscar/Downloads/Files for distribution/Files for distribution")
+source("C:/Users/wscar/Downloads/Files for distribution/Files for distribution/R Scripts/Battery.R")
+
+# High Peak Period (1:00 PM - 5:00 PM) - $9.70 per kW
+# Low Peak Period (10:00 AM - 1:00 PM) - $3.30 per kW
+
+energyFiles <- list(
+  "2020, Oxy Energy Use.txt",
+  "2021, Oxy Energy Use.txt",
+  "2022, Oxy Energy Use.txt",
+  "2023, Oxy Energy Use.txt"
+)
+
+
+# Holds Power vs Time for each year in the file list
+powerTables <- list()
+
+
+# populate the list of Power Usage vs Time for 2021 -2023
+
+for(file in energyFiles){
+  energy.values <- read.csv(file)
+  
+  #convert all time values to one format
+  energy.values$Time <- as.POSIXct(energy.values$Time, format = "%m/%d/%y %H:%M")
+  
+  #convert to kW
+  energy.values$College.Net.Use.kWh <- energy.values$College.Net.Use.kWh / 0.25/1000
+  
+  names(energy.values) <- c("Time", "Power")
+  
+  powerTables[[file]] <- energy.values
+  
+}
+
+names(powerTables) <- c("2020", "2021", "2022", "2023")
+
+
+
+
+cut.data <- function(signal, start.date, end.date){
+  
+  start.date <- as.POSIXct(start.date, format = "%Y-%m-%d %H:%M:%S")
+  end.date <- as.POSIXct(end.date, format = "%Y-%m-%d %H:%M:%S")
+  cut.signal <- subset(signal, as.POSIXct(signal[[1]] ) > start.date & as.POSIXct(signal[[1]]) < end.date)
+  return(cut.signal)
+}
+
+
+septPower <- list()
+
+
+# populates the list of power vs time for September only for all years in powerTables
+for(year in names(powerTables)){
+  table <- powerTables[[year]]
+  
+  sept.start <- as.POSIXct(paste0(year, "-09-01 00:00:00"), format = "%Y-%m-%d %H:%M:%S")
+  sept.end <- as.POSIXct(paste0(year, "-10-01 00:00:00"), format = "%Y-%m-%d %H:%M:%S")
+  
+  septPower[[year]] <- cut.data(table, sept.start, sept.end)
+  
+}
+
+
+septPower[["2021"]]
+
+
+
+#Strategy: Run the battery on max power between 1 and 5
+
+battery <- create_battery(0)
+battery(1)
+
+
+strategy1 <- function(signal){
+  sum.power <- signal
+  bat <- create_battery(0)
+  signal_times <- as.POSIXct(signal[[1]], format = "%Y-%m-%d %H:%M:%S")
+
+  
+  for(i in seq_along(signal_times)){
+    hr <- as.numeric(format(signal_times[i], "%H")) 
+    if(hr >= 13 && hr < 17){
+      charge.rate <- - (signal[[2]][i])
+    }else if(hr >= 10 && hr < 13){
+      charge.rate <- 0
+    }else{
+      charge.rate <- 1
+    }
+    
+    battery.out <- bat(charge.rate)
+    sum.power[[2]][i] <- signal[[2]][i] +  (battery.out)
+  }
+  
+  return(sum.power)
+}
+
+
+sumPwr21 <- strategy1(septPower[["2021"]])
+
+sumPwr21
+
+
+plot(septPower[["2021"]][[1]],septPower[["2021"]][[2]], ,type = "l",xlab = "Time", ylab = "Power (kW)", main = "Power vs Time" )
+
+
+get.CutOffvsDay <- function(power, start_x, end_x){
+  start.date <- as.POSIXct(start_x, format = "%Y-%m-%d %H:%M:%S")
+  end.date <- as.POSIXct(end_x, format = "%Y-%m-%d %H:%M:%S")
+  
+  day.sec <- 86400 # number of seconds in a day to iterate by day
+  
+  current.day.start <- start.date
+  current.day.end   <- start.date + as.difftime(1, units = "days")
+  
+  
+  cutoff_table <- data.frame(
+    Date = as.Date(character()),
+    Cutoff = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  
+  
+  while(current.day.start <= end.date){
+    signal <- cut.data(power, current.day.start, current.day.end)
+    day <- as.Date(format(current.day.start))
+    temp.cutOff <- findCutoff(signal)
+    
+    cutoff_table <- rbind(cutoff_table, data.frame(Date = day, Cutoff = temp.cutOff))
+    
+    
+    
+    current.day.start <- current.day.start + day.sec
+    current.day.end <- current.day.end + day.sec
+    print(paste("Day:", day, "Cutoff:", temp.cutOff))
+  }
+  
+  return(cutoff_table)
+}
+
+
+
+# finds cutoff for 1 day only cutting off between 1-5 PM
+findCutoff <- function(signal, step = 0.1, step.decimals = 1) {
+  signal_times <- as.POSIXct(signal[[1]], format = "%Y-%m-%d %H:%M:%S")
+  
+  cutOff <- floor(max(signal[[2]]) / step) * step
+  lastCutoff <- cutOff
+  running <- TRUE  
+  while(running){
+    sum.power <- signal
+    bat <- create_battery(0)
+    
+    for(i in seq_along(signal[[1]])){
+      hr <- as.numeric(format(signal_times[i], "%H")) 
+      if(hr >= 13 && hr < 17){
+        charge.rate <- (cutOff - signal[[2]][i])
+      }else if(hr >= 10 && hr < 13){
+        charge.rate <- 0
+      }else{
+        charge.rate <- 0.2
+      }
+      battery.out <- bat(charge.rate)
+      sum.power[[2]][i] <- signal[[2]][i] +  battery.out
+    }
+    #fail condition where battery runs out (last cutoff was optimal)
+    #only check if any of the values between 1-5 are above the cutoff for 1-5
+    high_idx <- which(format(signal_times, "%H") >= "13" & format(signal_times, "%H") < "17")
+    
+    if(any(sum.power[[2]][high_idx] > cutOff, na.rm = TRUE)){
+      return(lastCutoff)
+    }
+    else{
+      lastCutoff <- cutOff
+      cutOff <- cutOff - step
+      if (cutOff <= 0) stop("Cutoff dropped below 0")
+    }
+  }
+}
+
+
+optCutOff20 <- get.CutOffvsDay(powerTables[["2020"]], "2020-09-01 00:00:00", "2020-10-01 00:00:00")
+optCutOff21 <- get.CutOffvsDay(powerTables[["2021"]], "2021-09-01 00:00:00", "2021-10-01 00:00:00")
+optCutOff22 <-  get.CutOffvsDay(powerTables[["2022"]], "2022-09-01 00:00:00", "2022-10-01 00:00:00")
+optCutOff23 <-  get.CutOffvsDay(powerTables[["2023"]], "2023-09-01 00:00:00", "2023-10-01 00:00:00")
+
+
+
+test_model <- function(modeled.cutoff.table, signal){
+  sum.power <- signal
+  bat <- create_battery(0)
+  signal_dates <- as.Date(signal[[1]])
+  signal_times <- as.POSIXct(signal[[1]], format = "%Y-%m-%d %H:%M:%S")
+  
+  for(i in seq_along(signal_times)){
+    cutOff <- modeled.cutoff.table[[2]][modeled.cutoff.table[[1]] == signal_dates[i]]
+    
+    
+    
+    # Handle missing or multiple matches safely
+    if (length(cutOff) == 0 || all(is.na(cutOff))) {
+      message(paste("Missing cutOff for", signal_dates[i]))
+      cutOff <- 0
+    } else {
+      cutOff <- cutOff[1]  # take first value if multiple
+    }
+    
+    hr <- as.numeric(format(signal_times[i], "%H")) 
+    if(hr >= 13 && hr < 17){
+      charge.rate <- (cutOff - signal[[2]][i])
+    }else if(hr >= 10 && hr < 13){
+      charge.rate <- 0
+    }else{
+      charge.rate <- 0.2
+    }
+    battery.out <- bat(charge.rate)
+    sum.power[[2]][i] <- signal[[2]][i] +  battery.out
+    
+    
+    
+  }
+  
+  return(sum.power)
+}
+
+
+
+
+optCutOff21
+optCutOff22
+optCutOff23
+
+
+testOptimalModel <- test_model(optCutOff21, septPower[["2021"]])
+testOptimalModel
+plot(septPower[["2021"]][[1]],septPower[["2021"]][[2]], ,type = "l",xlab = "Time", ylab = "Power (kW)", main = "Power vs Time", col = "red", ylim = c(0,3) )
+lines(testOptimalModel[[1]], testOptimalModel[[2]], ,type = "l",xlab = "Time", ylab = "Power (kW)", main = "Power vs Time", col = "green", ylim = c(0,3) )
+
+
+plot(optCutOff21[[1]], optCutOff21[[2]], col = "blue", ylim = c(0,3), xlab = "Day", ylab = "Optimal Cutoff (Daily) [MW]")
+par(new=TRUE) 
+plot(optCutOff22[[1]], optCutOff22[[2]], col = "green", ylim = c(0,3), xlab = "Day", ylab = "Optimal Cutoff (Daily) [MW]")
+par(new=TRUE) 
+plot(optCutOff23[[1]], optCutOff23[[2]], col = "purple", ylim = c(0,3), xlab = "Day", ylab = "Optimal Cutoff (Daily) [MW]")
+
+
+
+
+#-----------use avg temp to predict cutoff------------------#
+# List of files and years
+years <- c(2020, 2021, 2022, 2023)
+files <- paste0("Temperature Quarter-Hour Averages ", years, ".txt")
+
+# Initialize combined results
+temps.avg.all <- data.frame(
+  Year = integer(),
+  Date = as.Date(character()),
+  Avg.Temp = numeric(),
+  stringsAsFactors = FALSE
+)
+
+
+day.sec <- 86400 # seconds in a day
+
+for (i in seq_along(files)) {
+  # Load file
+  tempData <- read.csv(files[i])
+  
+  # Convert to POSIX time
+  tempData$Time <- as.POSIXct(tempData$Time, format = "%Y-%m-%d %H:%M:%S")
+  
+  # Remove invalid entries
+  tempData <- subset(tempData, Average.Temperature.C != 1000000)
+  
+  # Initialize start/end of year
+  start.date <- as.POSIXct(paste0(years[i], "-09-01 00:00:00"), format = "%Y-%m-%d %H:%M:%S")
+  end.date <- as.POSIXct(paste0(years[i], "-10-02 00:00:00"), format = "%Y-%m-%d %H:%M:%S")
+  
+  current.day.start <- start.date
+  current.day.end <- current.day.start + day.sec
+  
+  temps.avg <- data.frame(
+    Date = as.Date(character()),
+    Avg.Temp = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Loop by day
+  while (current.day.end < end.date) {
+    temps.day <- cut.data(tempData, current.day.start, current.day.end)
+    day <- as.Date(format(current.day.start))
+    N <- nrow(temps.day)
+    
+    if (N > 0) {
+      day.avg.temp <- mean(temps.day$Average.Temperature.C)
+      temps.avg <- rbind(temps.avg, data.frame(Date = day, Avg.Temp = day.avg.temp))
+    }
+    
+    current.day.start <- current.day.start + day.sec
+    current.day.end <- current.day.end + day.sec
+  }
+  
+  # Add year column and merge
+  temps.avg$Year <- years[i]
+  temps.avg.all <- rbind(temps.avg.all, temps.avg)
+  
+  cat("Finished:", years[i], "with", nrow(temps.avg), "days averaged.\n")
+}
+
+# temps for sept 2020-2023
+temps.avg.all
+
+
+
+# Load dplyr for joins
+library(dplyr)
+
+# Ensure Date columns are in Date format (strip time)
+temps.avg.all$Date <- as.Date(temps.avg.all$Date)
+optCutOff20$Date <- as.Date(optCutOff20$Date)
+optCutOff21$Date <- as.Date(optCutOff21$Date)
+optCutOff22$Date <- as.Date(optCutOff22$Date)
+optCutOff23$Date <- as.Date(optCutOff23$Date)
+
+# Split the temperature data by year
+temps.avg.2020 <- temps.avg.all %>% filter(format(Date, "%Y") == "2020")
+temps.avg.2021 <- temps.avg.all %>% filter(format(Date, "%Y") == "2021")
+temps.avg.2022 <- temps.avg.all %>% filter(format(Date, "%Y") == "2022")
+temps.avg.2023 <- temps.avg.all %>% filter(format(Date, "%Y") == "2023")
+
+# Join each year’s cutoff table with the corresponding average temperature
+table2021 <- inner_join(optCutOff21, temps.avg.2021, by = "Date") %>%
+  select(Date, Avg.Temp, Cutoff)
+
+table2022 <- inner_join(optCutOff22, temps.avg.2022, by = "Date") %>%
+  select(Date, Avg.Temp, Cutoff)
+
+table2023 <- inner_join(optCutOff23, temps.avg.2023, by = "Date") %>%
+  select(Date, Avg.Temp, Cutoff)
+
+table2020 <- inner_join(optCutOff20, temps.avg.2020, by = "Date") %>%
+  select(Date, Avg.Temp, Cutoff)
+
+
+
+combinedTable <- rbind(table2021, table2022, table2023)
+
+# Optional: reorder columns for clarity
+combinedTable <- combinedTable[, c("Date", "Avg.Temp", "Cutoff")]
+
+# Find R^2 for Cutoff vs Temp on data from sept 2021-2023
+fit21 <- lm(Avg.Temp ~ Cutoff, data = combinedTable)
+summary(fit21)$r.squared
+#R^2 = 0.54
+
+# Training Points and Model Line 
+plot(table2021[[2]], table2021[[3]], col = "blue", ylim = c(0,3), xlim = c(15,32), xlab = "Temp C", ylab = "Optimal Cutoff (Daily) [MW]")
+par(new=TRUE) 
+plot(table2022[[2]], table2022[[3]], col = "green", ylim = c(0,3), xlim = c(15,32), xlab = "Temp C", ylab = "Optimal Cutoff (Daily) [MW]")
+par(new=TRUE) 
+plot(table2023[[2]], table2023[[3]], col = "purple", ylim = c(0,3), xlim = c(15,32), xlab = "Temp C", ylab = "Optimal Cutoff (Daily) [MW]")
+par(new=TRUE) 
+plot(table2020[[2]], table2020[[3]], col = "red", ylim = c(0,3), xlim = c(15,32), xlab = "Temp C", ylab = "Optimal Cutoff (Daily) [MW]")
+
+abline(a = 0, b=1/15, col = "red", lwd = 2, lty = 2)
+legend("topright", 
+       legend = c("2021", "2022", "2023", "Model"), 
+       col = c("blue", "green", "purple", "red"), 
+       pch = c(16, 16, 16, NA),       # point symbol for scatter, NA for line
+       lty = c(NA, NA, NA, 2),        # line type for custom line
+       lwd = c(NA, NA, NA, 2),        # line width for custom line
+       bty = "n")                     # no box around legend
+
+# Define the function
+model.cutOff <- function(tempTable, slope = 1/15, intercept = 0) {
+  # Make sure Avg.Temp exists
+  if (!"Avg.Temp" %in% colnames(tempTable)) {
+    stop("tempTable must have column 'Avg.Temp'")
+  }
+  
+  # Compute Cutoff
+  cutoff <- tempTable$Avg.Temp * slope + intercept
+  
+  # Return new table
+  result <- data.frame(
+    Date = tempTable$Date,
+    Cutoff = cutoff
+  )
+  
+  return(result)
+}
+
+temps.avg.2020 <- temps.avg.all[temps.avg.all$Year == 2020, ]
+
+temps.avg.2020
+cutOff20 <- model.cutOff(temps.avg.2020)
+cutOff20
+
+septPower[["2020"]]
+
+
+reduced.demand.2020 <- test_model(cutOff20, septPower[["2020"]])
+
+reduced.demand.2020
+
+
+
+plot(septPower[["2020"]][[1]],septPower[["2020"]][[2]], ,type = "l",xlab = "Time", ylab = "Power (kW)", main = "Power vs Time", col = "red", ylim = c(0,3) )
+lines(reduced.demand.2020[[1]], reduced.demand.2020[[2]], ,type = "l",xlab = "Time", ylab = "Power (kW)", main = "Power vs Time", col = "green", ylim = c(0,3) )
+
+
+
+modeled.cutOff21 <- model.cutOff(temps.avg.2021)
+
+modeled.cutOff22 <- model.cutOff(temps.avg.2022)
+modeled.cutOff23 <- model.cutOff(temps.avg.2023)
+
+
+reduced.demand.2021 <- test_model(modeled.cutOff21, septPower[["2021"]])
+reduced.demand.2022 <- test_model(modeled.cutOff22, septPower[["2022"]])
+reduced.demand.2023 <- test_model(modeled.cutOff23, septPower[["2023"]])
+
+
+
+
+plot(septPower[["2021"]][[1]],septPower[["2021"]][[2]], ,type = "l",xlab = "Time", ylab = "Power (kW)", main = "Power vs Time", col = "red", ylim = c(0,3) )
+lines(reduced.demand.2021[[1]], reduced.demand.2021[[2]], ,type = "l",xlab = "Time", ylab = "Power (kW)", main = "Power vs Time", col = "green", ylim = c(0,3) )
+
+
+calculate_demand_cost <- function(signal) {
+  # Expect signal columns: Time (POSIXct) and Power (numeric)
+  
+  # Convert to POSIXct if not already
+  signal$Time <- as.POSIXct(signal[[1]], format = "%Y-%m-%d %H:%M:%S")
+  signal$Power <- as.numeric(signal[[2]])
+  
+  # Extract hour from timestamp
+  signal$Hour <- as.numeric(format(signal$Time, "%H"))
+  
+  # Filter for 10am–1pm and 1pm–5pm
+  morning_period <- subset(signal, Hour >= 10 & Hour < 13)
+  afternoon_period <- subset(signal, Hour >= 13 & Hour < 17)
+  
+  # Find peak power in each range
+  morning_peak <- ifelse(nrow(morning_period) > 0, max(morning_period$Power, na.rm = TRUE), NA)
+  afternoon_peak <- ifelse(nrow(afternoon_period) > 0, max(afternoon_period$Power, na.rm = TRUE), NA)
+  
+  # Compute demand cost
+  total_cost <- (afternoon_peak*1000 * 9.7) + (morning_peak*1000 * 3.3)
+  
+  # Return results as a clean list or data frame
+  result <- data.frame(
+    Morning_Peak_kW = morning_peak,
+    Afternoon_Peak_kW = afternoon_peak,
+    Demand_Cost = total_cost
+  )
+  
+  return(result)
+}
+
+demand.Cost.2021 <- calculate_demand_cost(septPower[["2021"]])
+demand.Cost.2021
+reduced.demand.Cost.2021 <- calculate_demand_cost(reduced.demand.2021)
+reduced.demand.Cost.2021
+saved21 <- (demand.Cost.2021$Demand_Cost[1] - reduced.demand.Cost.2021$Demand_Cost[1])
+
+
+demand.Cost.2022 <- calculate_demand_cost(septPower[["2022"]])
+demand.Cost.2022
+reduced.demand.Cost.2022 <- calculate_demand_cost(reduced.demand.2022)
+reduced.demand.Cost.2022
+saved22 <- (demand.Cost.2022$Demand_Cost[1] - reduced.demand.Cost.2022$Demand_Cost[1])
+
+
+demand.Cost.2023 <- calculate_demand_cost(septPower[["2023"]])
+demand.Cost.2023
+reduced.demand.Cost.2023 <- calculate_demand_cost(reduced.demand.2023)
+reduced.demand.Cost.2023
+saved23 <- (demand.Cost.2023$Demand_Cost[1] - reduced.demand.Cost.2023$Demand_Cost[1])
+
+
+outcomes <- rbind(c("Years: ", "2021", "2022", "2023"), c("Savings: ", saved21, saved22, saved23))
+outcomes
